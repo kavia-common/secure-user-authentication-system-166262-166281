@@ -20,6 +20,7 @@ from ..models import (
 from ..deps import provide_supabase_client, provide_email_service, provide_settings
 from ..services.supabase_client import SupabaseAdminClient
 from ..services.email_service import EmailService
+from ..services.verification_code_dao import VerificationCodeDAO
 from ..config import Settings
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -84,46 +85,69 @@ def signup(
     settings: Settings = Depends(provide_settings),
 ) -> SignUpResponse:
     """
-    Create a user via Supabase Admin and send a confirmation/verification email.
+    Create a user via Supabase Admin and send a 6-digit verification code by email.
 
-    Parameters:
-    - email: Email for the new account
-    - password: Password for the new account
+    Flow:
+    1) Create user in Supabase with email_confirm=False.
+    2) Look up the created user by email to obtain user_id.
+    3) Generate a short-lived 6-digit verification code, store it in app.verification_codes.
+    4) Send a plain email containing only the 6-digit code (and brief instructions).
+    5) Do NOT generate or send magic verification links.
 
-    Returns: SignUpResponse with email and verification requirement flag.
+    Returns:
+        SignUpResponse: includes the email and requires_verification flag set to True.
     """
     _rate_limit_check(request, key_suffix="signup")
 
+    # 1) Create the user (not confirmed)
     try:
-        # Create the user (not confirmed)
         supabase.create_user(payload.email, payload.password)
     except Exception as exc:
-        # Safe error for client
         raise HTTPException(status_code=400, detail=_safe_detail(exc, "Unable to create user"))
 
-    # Use Supabase generate_link to produce a signup/verify link; email the link.
-    verify_link_info = None
+    # 2) Find the created user to get the user_id (required for verification code row)
+    # Using admin users list filtered by email.
     try:
-        verify_link_info = supabase.generate_link(payload.email, "signup", redirect_to=settings.SITE_URL)
+        import httpx  # local import to avoid top-level overhead
+        list_ep = f"{supabase.url.rstrip('/')}/auth/v1/admin/users"
+        with httpx.Client(timeout=15) as client:
+            resp = client.get(list_ep, headers=supabase._headers, params={"email": payload.email})
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Failed to fetch user: {resp.status_code} {resp.text}")
+            data = resp.json()
+            if isinstance(data, dict) and "users" in data:
+                users = data.get("users") or []
+            elif isinstance(data, list):
+                users = data
+            else:
+                users = []
+            if not users or not users[0].get("id"):
+                raise RuntimeError("User not found after creation")
+            user_id = users[0]["id"]
+    except Exception as exc:
+        # If we cannot fetch the user_id, return a client-facing error
+        raise HTTPException(status_code=400, detail=_safe_detail(exc, "Unable to create user"))
+
+    # 3) Create a 6-digit code and store it in app.verification_codes
+    try:
+        dao = VerificationCodeDAO(
+            supabase_url=settings.SUPABASE_URL,
+            service_role_key=settings.SUPABASE_SERVICE_ROLE_KEY,
+            default_ttl_sec=settings.VERIFICATION_CODE_TTL_SECONDS,
+        )
+        created = dao.create_code(user_id=user_id, email=payload.email, purpose="email_verification", ttl_seconds=settings.VERIFICATION_CODE_TTL_SECONDS, length=6)
+        code = created.get("code")
+        if not code:
+            raise RuntimeError("Code generation failed")
     except Exception:
-        # Non-fatal; we'll still attempt a generic email.
-        verify_link_info = None
+        raise HTTPException(status_code=500, detail="Failed to prepare verification code")
 
-    # Compose email
-    subject = "Verify your email"
-    body_lines = ["Welcome!",
-                  "Please verify your email to complete your registration."]
-    if verify_link_info and isinstance(verify_link_info, dict):
-        link = verify_link_info.get("properties", {}).get("action_link") or verify_link_info.get("action_link")
-        if link:
-            body_lines.append(f"Verification link: {link}")
-    body_lines.append("If you did not request this, you can safely ignore this message.")
-    body = "\n\n".join(body_lines)
-
+    # 4) Send plain email with only the code and short instructions
+    subject = "Your verification code"
+    body = f"{code}\n\nEnter this 6-digit code in the app to verify your email. The code expires in {int(settings.VERIFICATION_CODE_TTL_SECONDS/60)} minutes."
     try:
         email_service.send_email(payload.email, subject, body)
     except Exception:
-        # Do not leak internals
         raise HTTPException(status_code=500, detail="Failed to send verification email")
 
     return SignUpResponse(email=payload.email, requires_verification=True)
@@ -149,30 +173,57 @@ def send_verification_code(
     settings: Settings = Depends(provide_settings),
 ) -> None:
     """
-    Trigger sending a verification email to the specified address using Supabase.
+    Send or re-send a 6-digit verification code to the provided email.
+
+    Steps:
+    - Find user by email to get user_id (required for code row).
+    - Create and store a new code for purpose 'email_verification'.
+    - Email the code in plain text (no links).
     """
     _rate_limit_check(request, key_suffix="send-code")
 
+    # Find user by email
     try:
-        link_info = supabase.generate_link(payload.email, "signup", redirect_to=settings.SITE_URL)
+        import httpx
+        list_ep = f"{supabase.url.rstrip('/')}/auth/v1/admin/users"
+        with httpx.Client(timeout=15) as client:
+            resp = client.get(list_ep, headers=supabase._headers, params={"email": payload.email})
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Failed to fetch user: {resp.status_code} {resp.text}")
+            data = resp.json()
+            if isinstance(data, dict) and "users" in data:
+                users = data.get("users") or []
+            elif isinstance(data, list):
+                users = data
+            else:
+                users = []
+            if not users or not users[0].get("id"):
+                # To avoid user enumeration details, return 204 to avoid hinting existence
+                return None
+            user_id = users[0]["id"]
     except Exception:
+        # Avoid leaking details
         raise HTTPException(status_code=400, detail="Failed to request verification")
 
-    # Send the link (or an informational message) via email
-    subject = "Your verification link"
-    action_link = None
-    if isinstance(link_info, dict):
-        action_link = link_info.get("properties", {}).get("action_link") or link_info.get("action_link")
-    body = "Use the following link to verify your email."
-    if action_link:
-        body = f"{body}\n\n{action_link}"
-    else:
-        body = f"{body}\n\nPlease try again later."
+    # Create and email code
+    try:
+        dao = VerificationCodeDAO(
+            supabase_url=settings.SUPABASE_URL,
+            service_role_key=settings.SUPABASE_SERVICE_ROLE_KEY,
+            default_ttl_sec=settings.VERIFICATION_CODE_TTL_SECONDS,
+        )
+        created = dao.create_code(user_id=user_id, email=payload.email, purpose="email_verification", ttl_seconds=settings.VERIFICATION_CODE_TTL_SECONDS, length=6)
+        code = created.get("code")
+        if not code:
+            raise RuntimeError("Code generation failed")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to prepare verification code")
 
+    subject = "Your verification code"
+    body = f"{code}\n\nEnter this 6-digit code in the app to verify your email. The code expires in {int(settings.VERIFICATION_CODE_TTL_SECONDS/60)} minutes."
     try:
         email_service.send_email(payload.email, subject, body)
     except Exception:
-        # Silently ignore specifics to avoid leaking SMTP configuration
         raise HTTPException(status_code=500, detail="Failed to send verification email")
 
 
@@ -191,16 +242,85 @@ def send_verification_code(
 def verify_code(
     payload: VerifyCodeRequest,
     request: Request,
+    supabase: SupabaseAdminClient = Depends(provide_supabase_client),
+    settings: Settings = Depends(provide_settings),
 ) -> None:
     """
-    Placeholder for code verification using custom codes.
-    As this backend relies on Supabase's email link verification, this endpoint acts as a no-op,
-    but is kept for API compatibility. If custom code verification is later added (e.g., stored in DB),
-    implement validation logic and mark the user verified.
+    Verify a 6-digit code previously sent to the user's email.
+
+    Steps:
+    - Consume the code from app.verification_codes if valid and not expired.
+    - If consumed, call app.mark_email_verified(user_id) to mark profile as verified.
     """
     _rate_limit_check(request, key_suffix="verify")
-    # No-op: clients should follow the verification link delivered by Supabase's email.
-    return None
+
+    # Find user by email
+    try:
+        import httpx
+        list_ep = f"{supabase.url.rstrip('/')}/auth/v1/admin/users"
+        with httpx.Client(timeout=15) as client:
+            resp = client.get(list_ep, headers=supabase._headers, params={"email": payload.email})
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Failed to fetch user: {resp.status_code} {resp.text}")
+            data = resp.json()
+            if isinstance(data, dict) and "users" in data:
+                users = data.get("users") or []
+            elif isinstance(data, list):
+                users = data
+            else:
+                users = []
+            if not users or not users[0].get("id"):
+                raise RuntimeError("User not found")
+            user_id = users[0]["id"]
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid or expired code")
+
+    # Consume the code
+    try:
+        dao = VerificationCodeDAO(
+            supabase_url=settings.SUPABASE_URL,
+            service_role_key=settings.SUPABASE_SERVICE_ROLE_KEY,
+            default_ttl_sec=settings.VERIFICATION_CODE_TTL_SECONDS,
+        )
+        consumed = dao.consume_code(email=payload.email, purpose="email_verification", code=payload.code)
+        if not consumed:
+            raise HTTPException(status_code=400, detail="Invalid or expired code")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid or expired code")
+
+    # Mark profile verified using PostgREST RPC or direct update
+    try:
+        import httpx
+        rpc_ep = f"{settings.SUPABASE_URL.rstrip('/')}/rest/v1/rpc/mark_email_verified"
+        headers = {
+            "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": "application/json",
+            "Accept-Profile": "app",
+            "Content-Profile": "app",
+            "Accept": "application/json",
+        }
+        with httpx.Client(timeout=15) as client:
+            resp = client.post(rpc_ep, headers=headers, json={"p_user_id": user_id})
+            # If rpc not available, fallback to direct update
+            if resp.status_code >= 400:
+                # Attempt direct update of profiles.is_email_verified
+                profiles_ep = f"{settings.SUPABASE_URL.rstrip('/')}/rest/v1/profiles?id=eq.{user_id}"
+                upd_resp = client.patch(
+                    profiles_ep,
+                    headers={
+                        **headers,
+                        "Prefer": "resolution=merge-duplicates,return=representation",
+                    },
+                    json={"is_email_verified": True},
+                )
+                if upd_resp.status_code >= 400:
+                    raise RuntimeError(f"Failed to mark verified: {upd_resp.status_code} {upd_resp.text}")
+    except Exception:
+        # If marking verified fails, still keep code consumed; surface error
+        raise HTTPException(status_code=400, detail="Invalid or expired code")
 
 
 # PUBLIC_INTERFACE
