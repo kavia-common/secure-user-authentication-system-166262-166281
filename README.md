@@ -2,9 +2,14 @@
 
 This project uses Supabase for Authentication and Postgres storage.
 
-Supabase status:
-- The Supabase schema, functions, and RLS policies from authentication_backend/assets/supabase_schema.sql have been applied automatically via the configuration agent.
-- See authentication_backend/assets/supabase.md for details of what was applied and how to operate it.
+Reinitialization with a new Supabase project:
+- If you created a new Supabase project, update:
+  - authentication_backend/.env (see .env.example)
+  - authentication_frontend/.env (see .env.example)
+- Then apply SQL from either:
+  - authentication_backend/assets/supabase_users_unified.sql (recommended), or
+  - authentication_backend/assets/supabase_schema.sql (legacy)
+- See authentication_backend/assets/supabase.md for the complete guide.
 
 Before running the backend:
 
