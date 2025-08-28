@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.status import HTTP_404_NOT_FOUND
 
 from .config import get_settings, get_raw_env
 from .models import HealthResponse
@@ -71,8 +72,13 @@ app.add_middleware(
 )
 
 # Register global exception handlers
+# Catch-all for HTTPException to ensure JSON (not HTML) responses
 app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+# Explicit handler for 404 to avoid Starlette default HTML page if any middleware bypasses FastAPI routing
+app.add_exception_handler(HTTP_404_NOT_FOUND, http_exception_handler)  # type: ignore[arg-type]
+# Validation errors returned as JSON with details
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
+# Final safety net for unexpected exceptions
 app.add_exception_handler(Exception, generic_exception_handler)
 
 

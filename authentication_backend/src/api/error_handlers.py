@@ -12,6 +12,7 @@ from typing import Any, Dict
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .logging_config import get_logger
@@ -22,6 +23,7 @@ logger = get_logger(__name__)
 def _problem_response(status_code: int, detail: Any, *, extra: Dict[str, Any] | None = None) -> JSONResponse:
     """
     Create a JSONResponse following a simple problem style schema.
+    Forces Content-Type to application/json to avoid HTML renderers.
     """
     payload: Dict[str, Any] = {
         "status_code": status_code,
@@ -29,7 +31,10 @@ def _problem_response(status_code: int, detail: Any, *, extra: Dict[str, Any] | 
     }
     if extra:
         payload.update(extra)
-    return JSONResponse(status_code=status_code, content=payload)
+    resp = JSONResponse(status_code=status_code, content=payload)
+    # Ensure JSON content type explicitly
+    resp.media_type = "application/json"
+    return resp
 
 
 # PUBLIC_INTERFACE
@@ -47,7 +52,13 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException) 
         },
     )
     # Avoid leaking internal details if any
+    # Normalize detail to JSON-serializable primitive
     detail = exc.detail if exc.detail else "HTTP error"
+    try:
+        # If detail is not JSON-serializable (e.g., HTML/bytes), stringify safely
+        _ = {"detail": detail}  # type: ignore[dict-item]
+    except Exception:
+        detail = str(detail)
     return _problem_response(exc.status_code, detail)
 
 
