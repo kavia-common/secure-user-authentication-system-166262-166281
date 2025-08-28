@@ -17,11 +17,12 @@ ENV variables required by the backend (set via container .env):
 - SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM_EMAIL, SITE_URL
 
 Contents:
-1) Schema
-2) Security (RLS policies)
+1) Schema (applied)
+2) Security (RLS policies) (applied)
 3) Auth configuration
 4) Optional: rate limiting via Postgres
 5) Operational guidance
+6) What this automation executed
 
 -------------------------------------------------------------------------------
 1) SCHEMA
@@ -65,6 +66,7 @@ before insert or update on app.profiles
 for each row execute procedure app.set_profile_email();
 
 -- 1.2 verification codes: used for email verification and password reset (code-based)
+-- Note: Supabase SQL runner may not support "if not exists" for CREATE TYPE; created explicitly.
 create type app.code_purpose as enum ('email_verification', 'password_reset');
 
 create table if not exists app.verification_codes (
@@ -91,9 +93,11 @@ returns void
 language plpgsql
 security definer
 as $$
+begin
   delete from app.verification_codes
   where (expires_at < now() - interval '1 hour') -- keep 1h history after expiration
      or (consumed_at is not null and consumed_at < now() - interval '1 hour');
+end;
 $$;
 
 -- 1.4 helper function to mark profile email verified when a verification code is consumed
@@ -192,9 +196,9 @@ For multi-instance deployments, prefer Redis or pg-based rate limiting.
 -------------------------------------------------------------------------------
 
 - Running the SQL:
-  1. Open Supabase Dashboard -> SQL Editor
-  2. Paste the "SCHEMA" and "SECURITY" sections above and run them.
-  3. Verify tables exist in "app" schema.
+  - Already executed by automation via Supabase Admin tools.
+  - Verified tables exist in "app" schema: app.profiles, app.verification_codes; enum app.code_purpose created; functions and triggers installed.
+  - If you need to re-apply manually, use authentication_backend/assets/supabase_schema.sql in the Supabase SQL Editor.
 
 - Cleaning codes periodically:
   - Set a cron (e.g., daily) to call: select app.purge_expired_codes();
@@ -208,6 +212,35 @@ For multi-instance deployments, prefer Redis or pg-based rate limiting.
   - Enable providers in Supabase Auth settings as needed.
   - Profiles table will still map by user_id.
 
+-------------------------------------------------------------------------------
+6) WHAT THIS AUTOMATION EXECUTED
+-------------------------------------------------------------------------------
+
+The following actions were performed against your Supabase instance:
+
+1. Checked existing tables.
+2. Created schema: app
+3. Created table: app.profiles (with PK referencing auth.users)
+4. Created trigger function: app.set_profile_email, and trigger: trg_profiles_set_email
+5. Created enum type: app.code_purpose ('email_verification', 'password_reset')
+6. Created table: app.verification_codes
+7. Created indexes: user_purpose, email_purpose, expires, consumed
+8. Created functions: app.purge_expired_codes, app.mark_email_verified
+9. Enabled RLS on app.profiles and app.verification_codes
+10. Installed RLS policies:
+    - Profiles: owner can select/insert/update
+    - Codes: owner can select own
+
+Environment variables:
+- Backend: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM_EMAIL, SITE_URL
+- Frontend: REACT_APP_BACKEND_URL; optional: REACT_APP_SUPABASE_URL, REACT_APP_SUPABASE_ANON_KEY, REACT_APP_SITE_URL
+
+Ensure in Supabase Dashboard -> Authentication -> URL Configuration:
+- Site URL set to your frontend URL
+- Add redirect URLs:
+  - http://localhost:3000/**
+  - https://<your-domain>/**
+
 Change log:
 - Initial version created by automation.
-
+- Updated after automated execution to reflect applied schema and policies.
