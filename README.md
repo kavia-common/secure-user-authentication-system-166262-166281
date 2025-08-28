@@ -17,11 +17,14 @@ Before running the backend:
 - Authentication -> Email templates: adjust if needed.
 
 2) Configure environment
-- Create authentication_backend/.env and fill in values:
+- Create authentication_backend/.env and fill in values (backend-only names):
   - SUPABASE_URL
-  - SUPABASE_SERVICE_ROLE_KEY
+  - SUPABASE_SERVICE_ROLE_KEY  (Service Role key; DO NOT use anon/public key)
   - SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM_EMAIL
   - SITE_URL (frontend public URL used in email links)
+
+Notes:
+- Do not use frontend-style env names in the backend (avoid REACT_APP_* or NEXT_PUBLIC_*). They are ignored by the backend and may indicate misconfiguration.
 
 3) Run backend
 - Create virtualenv (optional), install dependencies, and start FastAPI:

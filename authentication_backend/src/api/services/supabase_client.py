@@ -14,15 +14,24 @@ import httpx
 
 @dataclass
 class SupabaseAdminClient:
-    """Minimal Supabase admin client using REST endpoints via httpx."""
+    """Minimal Supabase admin client using REST endpoints via httpx.
+
+    This client MUST be initialized with the Supabase Service Role key.
+    Do not pass the anon/public key here; admin endpoints will return 403 not_admin.
+    """
     url: str
     service_role_key: str
 
     @property
     def _headers(self) -> Dict[str, str]:
+        # Ensure we never accidentally put a blank or whitespace-padded key
+        srk = (self.service_role_key or "").strip()
+        if not srk:
+            raise RuntimeError("Supabase Service Role key is missing; cannot perform admin requests")
         return {
-            "apikey": self.service_role_key,
-            "Authorization": f"Bearer {self.service_role_key}",
+            # Both headers are required by Supabase admin endpoints
+            "apikey": srk,
+            "Authorization": f"Bearer {srk}",
             "Content-Type": "application/json",
         }
 
@@ -45,7 +54,14 @@ class SupabaseAdminClient:
             with httpx.Client(timeout=20) as client:
                 resp = client.post(endpoint, headers=self._headers, json=payload)
                 if resp.status_code >= 400:
-                    raise RuntimeError(f"Supabase create_user failed: {resp.status_code} {resp.text}")
+                    detail = resp.text
+                    if resp.status_code == 403 and "not_admin" in detail:
+                        raise RuntimeError(
+                            "Supabase create_user failed with 403 not_admin. "
+                            "Ensure SUPABASE_SERVICE_ROLE_KEY (service role) is configured in backend and used for admin calls. "
+                            "Do not use anon/public keys."
+                        )
+                    raise RuntimeError(f"Supabase create_user failed: {resp.status_code} {detail}")
                 return resp.json()
         except Exception as exc:
             raise RuntimeError(f"Supabase create_user error: {exc}") from exc

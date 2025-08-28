@@ -25,11 +25,18 @@ from .error_handlers import (
     validation_exception_handler,
     generic_exception_handler,
 )
+from .diagnostics import run_startup_diagnostics
 
 # Initialize settings and logging early
 settings = get_settings()
 configure_logging()
 logger = get_logger(__name__)
+# Run startup diagnostics to validate env variables and Supabase admin setup
+try:
+    run_startup_diagnostics()
+except Exception:
+    # Never fail app boot due to diagnostics; they only log insights.
+    logger.warning("Startup diagnostics encountered an error but was ignored for boot resilience")
 
 openapi_tags = [
     {
