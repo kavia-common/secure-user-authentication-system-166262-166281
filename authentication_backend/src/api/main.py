@@ -1,10 +1,22 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .config import get_settings
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from .config import get_settings, get_raw_env
 from .models import HealthResponse
 from .routers.auth import router as auth_router
+from .logging_config import configure_logging, get_logger
+from .error_handlers import (
+    http_exception_handler,
+    validation_exception_handler,
+    generic_exception_handler,
+)
 
+# Initialize settings and logging
 settings = get_settings()
+configure_logging()
+logger = get_logger(__name__)
 
 openapi_tags = [
     {
@@ -24,13 +36,33 @@ app = FastAPI(
     openapi_tags=openapi_tags,
 )
 
+# CORS configuration:
+# - In development (APP_ENV != production): allow all origins for ease of local dev.
+# - In production: restrict to FRONTEND_BASE_URL if present, else fall back to CORS_ALLOW_ORIGINS.
+app_env = (settings.APP_ENV or "development").lower()
+frontend_base = get_raw_env("FRONTEND_BASE_URL", "").strip()
+if app_env == "production":
+    if frontend_base:
+        allow_origins = [frontend_base]
+    else:
+        # fallback to configured list or block by default to avoid open CORS in prod
+        configured = [o.strip() for o in (settings.CORS_ALLOW_ORIGINS or "").split(",") if o.strip()]
+        allow_origins = configured if configured else []
+else:
+    allow_origins = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in settings.CORS_ALLOW_ORIGINS.split(",")] if settings.CORS_ALLOW_ORIGINS else ["*"],
+    allow_origins=allow_origins if allow_origins else [],  # empty list means no cross-origin allowed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Register global exception handlers
+app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+app.add_exception_handler(RequestValidationError, validation_exception_handler)
+app.add_exception_handler(Exception, generic_exception_handler)
 
 
 # PUBLIC_INTERFACE
@@ -43,6 +75,7 @@ app.add_middleware(
 )
 def health_check() -> HealthResponse:
     """Service health check endpoint."""
+    logger.debug("Health check invoked")
     return HealthResponse(message="Healthy")
 
 

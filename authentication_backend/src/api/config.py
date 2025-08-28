@@ -26,9 +26,12 @@ class Settings(BaseModel):
     APP_NAME: str = Field("Authentication Backend", description="Application name.")
     APP_ENV: str = Field("development", description="Application environment (development/staging/production).")
     APP_DEBUG: bool = Field(True, description="Enable debug mode.")
+    LOG_LEVEL: Optional[str] = Field(default=None, description="Optional explicit log level (DEBUG, INFO, WARNING, ERROR).")
 
     # CORS
     CORS_ALLOW_ORIGINS: str = Field("*", description="Comma-separated list of allowed CORS origins.")
+    # In production, FRONTEND_BASE_URL is preferred for single-frontend deployments.
+    FRONTEND_BASE_URL: Optional[str] = Field(default=None, description="Frontend base URL used for strict CORS in production.")
 
     # Supabase admin credentials
     SUPABASE_URL: str = Field(..., description="Supabase project URL, e.g., https://xyzcompany.supabase.co")
@@ -68,8 +71,10 @@ def get_settings() -> Settings:
             APP_NAME=get_raw_env("APP_NAME", "Authentication Backend"),
             APP_ENV=get_raw_env("APP_ENV", "development"),
             APP_DEBUG=get_raw_env("APP_DEBUG", "true").lower() in ("1", "true", "yes"),
+            LOG_LEVEL=get_raw_env("LOG_LEVEL"),
 
             CORS_ALLOW_ORIGINS=get_raw_env("CORS_ALLOW_ORIGINS", "*"),
+            FRONTEND_BASE_URL=get_raw_env("FRONTEND_BASE_URL"),
 
             SUPABASE_URL=get_raw_env("SUPABASE_URL", "") or "",  # force validation error if missing
             SUPABASE_SERVICE_ROLE_KEY=get_raw_env("SUPABASE_SERVICE_ROLE_KEY", "") or "",
