@@ -59,6 +59,19 @@ create table if not exists public.users (
   updated_at timestamptz not null default now()
 );
 
+-- 2b) Create pending_signups table for pre-verification state
+-- Stores temporary signup info until code is verified; deleted on success.
+create table if not exists public.pending_signups (
+  id uuid primary key default gen_random_uuid(),
+  email text not null unique,
+  password text not null,                              -- temporarily store password until verified
+  verification_code text not null,
+  code_expires_at timestamptz not null,
+  attempts int not null default 0,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 -- 3) Update trigger to maintain updated_at on row modification
 create or replace function public.set_updated_at()
 returns trigger
@@ -75,20 +88,32 @@ create trigger trg_users_set_updated_at
 before update on public.users
 for each row execute procedure public.set_updated_at();
 
+-- Trigger for pending_signups
+drop trigger if exists trg_pending_signups_set_updated_at on public.pending_signups;
+create trigger trg_pending_signups_set_updated_at
+before update on public.pending_signups
+for each row execute procedure public.set_updated_at();
+
 -- 4) Useful indexes
 create index if not exists idx_users_email on public.users (lower(email));
 create index if not exists idx_users_verification_expiry on public.users (code_expires_at);
 create index if not exists idx_users_reset_expiry on public.users (password_reset_expires);
 
+create index if not exists idx_pending_signups_email on public.pending_signups (lower(email));
+create index if not exists idx_pending_signups_expiry on public.pending_signups (code_expires_at);
+
 -- 5) RLS Policies (optional; comment out if you rely on service role exclusively)
 -- For admin/backend access via Service Role, RLS can be enabled but your Service Role bypasses RLS.
 -- Enable RLS to ensure public/anon access is restricted by default.
 alter table public.users enable row level security;
+alter table public.pending_signups enable row level security;
 
 -- Remove existing policies if re-running
 drop policy if exists "Users: no select for anon" on public.users;
 drop policy if exists "Users: owner can select self" on public.users;
 drop policy if exists "Users: owner can update self-safe" on public.users;
+
+drop policy if exists "Pending: no select for anon" on public.pending_signups;
 
 -- Only authenticated users can select their own row (optional)
 create policy "Users: owner can select self"
@@ -103,6 +128,12 @@ on public.users for update
 to authenticated
 using (auth.email() is not null and lower(email) = lower(auth.email()))
 with check (auth.email() is not null and lower(email) = lower(auth.email()));
+
+-- Pending_signups is server-managed only; block client access (no select/update/insert for authenticated)
+create policy "Pending: no select for anon"
+on public.pending_signups for select
+to anon
+using (false);
 
 commit;
 

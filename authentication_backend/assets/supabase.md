@@ -35,7 +35,7 @@ Frontend environment variables:
 - Optional: REACT_APP_SUPABASE_URL, REACT_APP_SUPABASE_ANON_KEY, REACT_APP_SITE_URL
 
 Which schema should I use?
-- Unified (recommended): Stores verification/reset codes directly on public.users; backend already uses this flow via PostgREST.
+- Unified (recommended): Stores reset codes on public.users and uses a temporary table public.pending_signups for pre-verification signup state; the backend moves data to public.users only after successful code verification.
 - Legacy: Separate app.profiles and app.verification_codes tables with RLS; still supported by assets for backward compatibility.
 
 Apply SQL (Unified):

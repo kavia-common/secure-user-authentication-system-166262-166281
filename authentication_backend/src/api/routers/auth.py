@@ -176,50 +176,36 @@ def signup(
     settings: Settings = Depends(provide_settings),
 ) -> SignUpResponse:
     """
-    Create a user via Supabase Auth Admin and store unified state in public.users.
-    Then generate a 6-digit verification code stored in public.users and email it.
+    Initiate signup by storing pending state and sending a 6-digit code.
+    No user is created in public.users or Supabase Auth until verification succeeds.
     """
     _rate_limit_check(request, key_suffix="signup")
 
-    # 1) Create user in Supabase Auth (not confirmed)
+    # 1) If a verified user already exists, block duplicate signup
     try:
-        supabase.create_user(payload.email, payload.password)
-    except Exception as exc:
-        # If user already exists in auth, still proceed to ensure we create/refresh unified users row/code
-        msg = str(exc).lower()
-        if "already registered" not in msg and "user exists" not in msg:
-            raise HTTPException(status_code=400, detail=_safe_detail(exc, "Unable to create user"))
+        existing_user = _get_user_row_by_email(settings, payload.email)
+        if existing_user and bool(existing_user.get("is_email_verified")):
+            raise HTTPException(status_code=400, detail="User with this email already exists")
+    except HTTPException:
+        raise
+    except Exception:
+        # Do not fail hard; proceed to pending path
+        existing_user = None
 
-    # 2) Create/ensure unified users row
-    try:
-        existing = _get_user_row_by_email(settings, payload.email)
-        if existing is None:
-            try:
-                _insert_user_row(settings, payload.email, "<managed-by-auth>")  # password managed by Supabase Auth
-            except ValueError:
-                # Race: created by another request
-                pass
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=_safe_detail(exc, "Unable to initialize user"))
-
-    # 3) Generate and persist a 6-digit code in public.users
+    # 2) Prepare 6-digit code and save into pending_signups
     code = _gen_numeric_code(6)
     expires_at = _now_utc() + dt.timedelta(seconds=settings.VERIFICATION_CODE_TTL_SECONDS)
+    from ..services.pending_signup_dao import upsert_pending  # local import to avoid circulars
     try:
-        _update_user_row(
-            settings,
-            payload.email,
-            {
-                "current_verification_code": code,
-                "code_expires_at": _iso_utc(expires_at),
-                "code_attempts": 0,
-                "is_email_verified": False,
-            },
-        )
+        upsert_pending(settings, payload.email, payload.password, code, _iso_utc(expires_at))
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=_safe_detail(exc, "Failed to prepare verification code"))
+        # If unique email constraint conflict with verified user, treat as already exists
+        msg = str(exc).lower()
+        if "duplicate" in msg or "unique" in msg or "already exists" in msg or "conflict" in msg:
+            raise HTTPException(status_code=400, detail="User with this email already exists")
+        raise HTTPException(status_code=400, detail=_safe_detail(exc, "Unable to start signup"))
 
-    # 4) Email the code
+    # 3) Send email
     subject = "Your verification code"
     body = f"{code}\n\nEnter this 6-digit code in the app to verify your email. The code expires in {int(settings.VERIFICATION_CODE_TTL_SECONDS/60)} minutes."
     try:
@@ -250,43 +236,35 @@ def send_verification_code(
     settings: Settings = Depends(provide_settings),
 ) -> None:
     """
-    Send or re-send a 6-digit verification code and store it on public.users.
+    Send or re-send a 6-digit verification code and store it on public.pending_signups.
+    This endpoint is for pre-verification stage.
     """
     _rate_limit_check(request, key_suffix="send-code")
 
-    # If user doesn't exist in auth or unified users, avoid leaking info: still return 204
-    try:
-        user_row = _get_user_row_by_email(settings, payload.email)
-        if user_row is None:
-            # Try to ensure presence by creating a minimal row (no-op if auth not present)
-            try:
-                _insert_user_row(settings, payload.email, "<managed-by-auth>")
-            except ValueError:
-                pass
-    except Exception:
-        raise HTTPException(status_code=400, detail="Failed to request verification")
+    from ..services.pending_signup_dao import get_pending_by_email, upsert_pending
 
+    # If there is no pending record, create one with a dummy password to allow code resend flow.
+    # We do not reveal whether a verified user exists; always return 204.
     code = _gen_numeric_code(6)
     expires_at = _now_utc() + dt.timedelta(seconds=settings.VERIFICATION_CODE_TTL_SECONDS)
     try:
-        _update_user_row(
-            settings,
-            payload.email,
-            {
-                "current_verification_code": code,
-                "code_expires_at": _iso_utc(expires_at),
-                "code_attempts": 0,
-            },
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=_safe_detail(exc, "Failed to prepare verification code"))
+        pending = get_pending_by_email(settings, payload.email)
+        if pending is None:
+            # Use placeholder password; user should have come from /signup, but allow resend
+            upsert_pending(settings, payload.email, "<pending>", code, _iso_utc(expires_at))
+        else:
+            upsert_pending(settings, payload.email, pending.password or "<pending>", code, _iso_utc(expires_at))
+    except Exception:
+        # Do not leak details; still try to send email if possible, or ignore
+        pass
 
     subject = "Your verification code"
     body = f"{code}\n\nEnter this 6-digit code in the app to verify your email. The code expires in {int(settings.VERIFICATION_CODE_TTL_SECONDS/60)} minutes."
     try:
         email_service.send_email(payload.email, subject, body)
     except Exception:
-        raise HTTPException(status_code=500, detail="Failed to send verification email")
+        # Swallow errors to avoid enumeration
+        return None
 
 
 # PUBLIC_INTERFACE
@@ -308,14 +286,17 @@ def verify_code(
     settings: Settings = Depends(provide_settings),
 ) -> None:
     """
-    Verify a 6-digit code stored on public.users. On success, set is_email_verified=true and clear code fields.
+    Verify a 6-digit code from pending_signups. If valid, create user in Supabase Auth,
+    insert verified row into public.users, and delete the pending record.
     """
     _rate_limit_check(request, key_suffix="verify")
 
-    # Load user row
+    from ..services.pending_signup_dao import get_pending_by_email, increment_attempts, delete_pending
+
+    # Load pending row
     try:
-        row = _get_user_row_by_email(settings, payload.email)
-        if not row:
+        pending = get_pending_by_email(settings, payload.email)
+        if not pending:
             raise HTTPException(status_code=400, detail="Invalid or expired code")
     except HTTPException:
         raise
@@ -323,18 +304,14 @@ def verify_code(
         raise HTTPException(status_code=400, detail="Invalid or expired code")
 
     # Validate code and expiry
-    code = (row.get("current_verification_code") or "").strip()
-    exp = row.get("code_expires_at")
     try:
-        exp_dt = dt.datetime.fromisoformat(str(exp).replace("Z", "+00:00")) if exp else None
+        exp_dt = dt.datetime.fromisoformat(str(pending.code_expires_at).replace("Z", "+00:00")) if pending.code_expires_at else None
     except Exception:
         exp_dt = None
 
-    if (not code) or (payload.code != code):
-        # Increment attempts for throttling/observability
+    if (not pending.verification_code) or (payload.code.strip() != pending.verification_code.strip()):
         try:
-            current_attempts = int(row.get("code_attempts") or 0) + 1
-            _update_user_row(settings, payload.email, {"code_attempts": current_attempts})
+            increment_attempts(settings, payload.email)
         except Exception:
             pass
         raise HTTPException(status_code=400, detail="Invalid or expired code")
@@ -342,8 +319,24 @@ def verify_code(
     if (not exp_dt) or (exp_dt < _now_utc()):
         raise HTTPException(status_code=400, detail="Invalid or expired code")
 
-    # Consume code and mark email verified
+    # Create user in Supabase Auth now (confirmed)
     try:
+        supabase.create_user(payload.email, pending.password)
+    except Exception as exc:
+        # If user already exists in auth, treat as conflict
+        msg = str(exc).lower()
+        if "already" in msg or "exists" in msg or "registered" in msg:
+            # Continue; user already present at auth level
+            pass
+        else:
+            raise HTTPException(status_code=400, detail="Invalid or expired code")
+
+    # Insert verified user row into public.users
+    try:
+        # If user row exists, update; else insert
+        existing = _get_user_row_by_email(settings, payload.email)
+        if existing is None:
+            _insert_user_row(settings, payload.email, "<managed-by-auth>")
         _update_user_row(
             settings,
             payload.email,
@@ -355,7 +348,15 @@ def verify_code(
             },
         )
     except Exception:
+        # If we fail to create/update user row, treat as generic failure to avoid partial state
         raise HTTPException(status_code=400, detail="Invalid or expired code")
+
+    # Cleanup pending row
+    try:
+        delete_pending(settings, payload.email)
+    except Exception:
+        # non-fatal
+        pass
 
 
 # PUBLIC_INTERFACE
