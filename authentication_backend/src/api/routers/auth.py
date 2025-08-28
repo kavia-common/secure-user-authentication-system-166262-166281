@@ -1,9 +1,20 @@
 """
 Authentication API router.
 Defines endpoints for sign up, send verification code, verify code, sign in, and forgot/reset password.
+
+This refactor unifies all state into public.users:
+- email, hashed_password, is_email_verified
+- current_verification_code, code_expires_at, code_attempts
+- password_reset_code, password_reset_expires
+
+Legacy dependencies on app.profiles and app.verification_codes are removed.
 """
 
 import time
+import secrets
+import datetime as dt
+from typing import Optional, Dict, Any
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi import Request
 
@@ -20,7 +31,6 @@ from ..models import (
 from ..deps import provide_supabase_client, provide_email_service, provide_settings
 from ..services.supabase_client import SupabaseAdminClient
 from ..services.email_service import EmailService
-from ..services.verification_code_dao import VerificationCodeDAO
 from ..config import Settings
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -63,6 +73,87 @@ def _safe_detail(exc: Exception, default_msg: str = "Unexpected error") -> str:
     return text[:240]
 
 
+def _now_utc() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _iso_utc(dt_value: dt.datetime) -> str:
+    return dt_value.astimezone(dt.timezone.utc).replace(tzinfo=dt.timezone.utc).isoformat()
+
+
+def _gen_numeric_code(length: int = 6) -> str:
+    digits = "0123456789"
+    first = secrets.choice("123456789")
+    rest = "".join(secrets.choice(digits) for _ in range(max(0, length - 1)))
+    return first + rest
+
+
+def _postgrest_headers(settings: Settings) -> Dict[str, str]:
+    srk = settings.SUPABASE_SERVICE_ROLE_KEY.strip()
+    return {
+        "apikey": srk,
+        "Authorization": f"Bearer {srk}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Prefer": "return=representation,resolution=merge-duplicates",
+    }
+
+
+def _users_endpoint(settings: Settings) -> str:
+    return f"{settings.SUPABASE_URL.rstrip('/')}/rest/v1/users"
+
+
+def _get_user_row_by_email(settings: Settings, email: str) -> Optional[Dict[str, Any]]:
+    import httpx
+    ep = f"{_users_endpoint(settings)}?select=*&email=eq.{email}"
+    try:
+        with httpx.Client(timeout=20) as client:
+            resp = client.get(ep, headers=_postgrest_headers(settings))
+            if resp.status_code >= 400:
+                raise RuntimeError(f"users select failed: {resp.status_code} {resp.text}")
+            data = resp.json()
+            if isinstance(data, list):
+                return data[0] if data else None
+            return data or None
+    except Exception as exc:
+        raise RuntimeError(f"Failed to query users: {exc}") from exc
+
+
+def _insert_user_row(settings: Settings, email: str, hashed_password: str) -> Dict[str, Any]:
+    import httpx
+    row = {"email": email, "hashed_password": hashed_password, "is_email_verified": False}
+    try:
+        with httpx.Client(timeout=20) as client:
+            resp = client.post(_users_endpoint(settings), headers=_postgrest_headers(settings), json=row)
+            if resp.status_code >= 400:
+                msg = resp.text.lower()
+                if "duplicate key" in msg or "unique" in msg or "already exists" in msg or resp.status_code in (409,):
+                    raise ValueError("User with this email already exists")
+                raise RuntimeError(f"users insert failed: {resp.status_code} {resp.text}")
+            data = resp.json()
+            return data[0] if isinstance(data, list) and data else data
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Failed to create user row: {exc}") from exc
+
+
+def _update_user_row(settings: Settings, email: str, values: Dict[str, Any]) -> Dict[str, Any]:
+    import httpx
+    ep = f"{_users_endpoint(settings)}?email=eq.{email}"
+    try:
+        with httpx.Client(timeout=20) as client:
+            resp = client.patch(ep, headers=_postgrest_headers(settings), json=values)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"users update failed: {resp.status_code} {resp.text}")
+            data = resp.json()
+            if isinstance(data, list):
+                return data[0] if data else {}
+            return data
+    except Exception as exc:
+        raise RuntimeError(f"Failed to update user row: {exc}") from exc
+
+
 # PUBLIC_INTERFACE
 @router.post(
     "/signup",
@@ -85,65 +176,50 @@ def signup(
     settings: Settings = Depends(provide_settings),
 ) -> SignUpResponse:
     """
-    Create a user via Supabase Admin and send a 6-digit verification code by email.
-
-    Flow:
-    1) Create user in Supabase with email_confirm=False.
-    2) Look up the created user by email to obtain user_id.
-    3) Generate a short-lived 6-digit verification code, store it in app.verification_codes.
-    4) Send a plain email containing only the 6-digit code (and brief instructions).
-    5) Do NOT generate or send magic verification links.
-
-    Returns:
-        SignUpResponse: includes the email and requires_verification flag set to True.
+    Create a user via Supabase Auth Admin and store unified state in public.users.
+    Then generate a 6-digit verification code stored in public.users and email it.
     """
     _rate_limit_check(request, key_suffix="signup")
 
-    # 1) Create the user (not confirmed)
+    # 1) Create user in Supabase Auth (not confirmed)
     try:
         supabase.create_user(payload.email, payload.password)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=_safe_detail(exc, "Unable to create user"))
+        # If user already exists in auth, still proceed to ensure we create/refresh unified users row/code
+        msg = str(exc).lower()
+        if "already registered" not in msg and "user exists" not in msg:
+            raise HTTPException(status_code=400, detail=_safe_detail(exc, "Unable to create user"))
 
-    # 2) Find the created user to get the user_id (required for verification code row)
-    # Using admin users list filtered by email.
+    # 2) Create/ensure unified users row
     try:
-        import httpx  # local import to avoid top-level overhead
-        list_ep = f"{supabase.url.rstrip('/')}/auth/v1/admin/users"
-        with httpx.Client(timeout=15) as client:
-            resp = client.get(list_ep, headers=supabase._headers, params={"email": payload.email})
-            if resp.status_code >= 400:
-                raise RuntimeError(f"Failed to fetch user: {resp.status_code} {resp.text}")
-            data = resp.json()
-            if isinstance(data, dict) and "users" in data:
-                users = data.get("users") or []
-            elif isinstance(data, list):
-                users = data
-            else:
-                users = []
-            if not users or not users[0].get("id"):
-                raise RuntimeError("User not found after creation")
-            user_id = users[0]["id"]
+        existing = _get_user_row_by_email(settings, payload.email)
+        if existing is None:
+            try:
+                _insert_user_row(settings, payload.email, "<managed-by-auth>")  # password managed by Supabase Auth
+            except ValueError:
+                # Race: created by another request
+                pass
     except Exception as exc:
-        # If we cannot fetch the user_id, return a client-facing error
-        raise HTTPException(status_code=400, detail=_safe_detail(exc, "Unable to create user"))
+        raise HTTPException(status_code=400, detail=_safe_detail(exc, "Unable to initialize user"))
 
-    # 3) Create a 6-digit code and store it in app.verification_codes
+    # 3) Generate and persist a 6-digit code in public.users
+    code = _gen_numeric_code(6)
+    expires_at = _now_utc() + dt.timedelta(seconds=settings.VERIFICATION_CODE_TTL_SECONDS)
     try:
-        dao = VerificationCodeDAO(
-            supabase_url=settings.SUPABASE_URL,
-            service_role_key=settings.SUPABASE_SERVICE_ROLE_KEY,
-            default_ttl_sec=settings.VERIFICATION_CODE_TTL_SECONDS,
+        _update_user_row(
+            settings,
+            payload.email,
+            {
+                "current_verification_code": code,
+                "code_expires_at": _iso_utc(expires_at),
+                "code_attempts": 0,
+                "is_email_verified": False,
+            },
         )
-        created = dao.create_code(user_id=user_id, email=payload.email, purpose="email_verification", ttl_seconds=settings.VERIFICATION_CODE_TTL_SECONDS, length=6)
-        code = created.get("code")
-        if not code:
-            raise RuntimeError("Code generation failed")
     except Exception as exc:
-        # Surface a concise reason to aid troubleshooting while not leaking secrets
         raise HTTPException(status_code=500, detail=_safe_detail(exc, "Failed to prepare verification code"))
 
-    # 4) Send plain email with only the code and short instructions
+    # 4) Email the code
     subject = "Your verification code"
     body = f"{code}\n\nEnter this 6-digit code in the app to verify your email. The code expires in {int(settings.VERIFICATION_CODE_TTL_SECONDS/60)} minutes."
     try:
@@ -174,49 +250,34 @@ def send_verification_code(
     settings: Settings = Depends(provide_settings),
 ) -> None:
     """
-    Send or re-send a 6-digit verification code to the provided email.
-
-    Steps:
-    - Find user by email to get user_id (required for code row).
-    - Create and store a new code for purpose 'email_verification'.
-    - Email the code in plain text (no links).
+    Send or re-send a 6-digit verification code and store it on public.users.
     """
     _rate_limit_check(request, key_suffix="send-code")
 
-    # Find user by email
+    # If user doesn't exist in auth or unified users, avoid leaking info: still return 204
     try:
-        import httpx
-        list_ep = f"{supabase.url.rstrip('/')}/auth/v1/admin/users"
-        with httpx.Client(timeout=15) as client:
-            resp = client.get(list_ep, headers=supabase._headers, params={"email": payload.email})
-            if resp.status_code >= 400:
-                raise RuntimeError(f"Failed to fetch user: {resp.status_code} {resp.text}")
-            data = resp.json()
-            if isinstance(data, dict) and "users" in data:
-                users = data.get("users") or []
-            elif isinstance(data, list):
-                users = data
-            else:
-                users = []
-            if not users or not users[0].get("id"):
-                # To avoid user enumeration details, return 204 to avoid hinting existence
-                return None
-            user_id = users[0]["id"]
+        user_row = _get_user_row_by_email(settings, payload.email)
+        if user_row is None:
+            # Try to ensure presence by creating a minimal row (no-op if auth not present)
+            try:
+                _insert_user_row(settings, payload.email, "<managed-by-auth>")
+            except ValueError:
+                pass
     except Exception:
-        # Avoid leaking details
         raise HTTPException(status_code=400, detail="Failed to request verification")
 
-    # Create and email code
+    code = _gen_numeric_code(6)
+    expires_at = _now_utc() + dt.timedelta(seconds=settings.VERIFICATION_CODE_TTL_SECONDS)
     try:
-        dao = VerificationCodeDAO(
-            supabase_url=settings.SUPABASE_URL,
-            service_role_key=settings.SUPABASE_SERVICE_ROLE_KEY,
-            default_ttl_sec=settings.VERIFICATION_CODE_TTL_SECONDS,
+        _update_user_row(
+            settings,
+            payload.email,
+            {
+                "current_verification_code": code,
+                "code_expires_at": _iso_utc(expires_at),
+                "code_attempts": 0,
+            },
         )
-        created = dao.create_code(user_id=user_id, email=payload.email, purpose="email_verification", ttl_seconds=settings.VERIFICATION_CODE_TTL_SECONDS, length=6)
-        code = created.get("code")
-        if not code:
-            raise RuntimeError("Code generation failed")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=_safe_detail(exc, "Failed to prepare verification code"))
 
@@ -247,80 +308,53 @@ def verify_code(
     settings: Settings = Depends(provide_settings),
 ) -> None:
     """
-    Verify a 6-digit code previously sent to the user's email.
-
-    Steps:
-    - Consume the code from app.verification_codes if valid and not expired.
-    - If consumed, call app.mark_email_verified(user_id) to mark profile as verified.
+    Verify a 6-digit code stored on public.users. On success, set is_email_verified=true and clear code fields.
     """
     _rate_limit_check(request, key_suffix="verify")
 
-    # Find user by email
+    # Load user row
     try:
-        import httpx
-        list_ep = f"{supabase.url.rstrip('/')}/auth/v1/admin/users"
-        with httpx.Client(timeout=15) as client:
-            resp = client.get(list_ep, headers=supabase._headers, params={"email": payload.email})
-            if resp.status_code >= 400:
-                raise RuntimeError(f"Failed to fetch user: {resp.status_code} {resp.text}")
-            data = resp.json()
-            if isinstance(data, dict) and "users" in data:
-                users = data.get("users") or []
-            elif isinstance(data, list):
-                users = data
-            else:
-                users = []
-            if not users or not users[0].get("id"):
-                raise RuntimeError("User not found")
-            user_id = users[0]["id"]
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid or expired code")
-
-    # Consume the code
-    try:
-        dao = VerificationCodeDAO(
-            supabase_url=settings.SUPABASE_URL,
-            service_role_key=settings.SUPABASE_SERVICE_ROLE_KEY,
-            default_ttl_sec=settings.VERIFICATION_CODE_TTL_SECONDS,
-        )
-        consumed = dao.consume_code(email=payload.email, purpose="email_verification", code=payload.code)
-        if not consumed:
+        row = _get_user_row_by_email(settings, payload.email)
+        if not row:
             raise HTTPException(status_code=400, detail="Invalid or expired code")
     except HTTPException:
         raise
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid or expired code")
 
-    # Mark profile verified using PostgREST RPC or direct update
+    # Validate code and expiry
+    code = (row.get("current_verification_code") or "").strip()
+    exp = row.get("code_expires_at")
     try:
-        import httpx
-        rpc_ep = f"{settings.SUPABASE_URL.rstrip('/')}/rest/v1/rpc/mark_email_verified"
-        headers = {
-            "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
-            "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
-            "Content-Type": "application/json",
-            "Accept-Profile": "app",
-            "Content-Profile": "app",
-            "Accept": "application/json",
-        }
-        with httpx.Client(timeout=15) as client:
-            resp = client.post(rpc_ep, headers=headers, json={"p_user_id": user_id})
-            # If rpc not available, fallback to direct update
-            if resp.status_code >= 400:
-                # Attempt direct update of profiles.is_email_verified
-                profiles_ep = f"{settings.SUPABASE_URL.rstrip('/')}/rest/v1/profiles?id=eq.{user_id}"
-                upd_resp = client.patch(
-                    profiles_ep,
-                    headers={
-                        **headers,
-                        "Prefer": "resolution=merge-duplicates,return=representation",
-                    },
-                    json={"is_email_verified": True},
-                )
-                if upd_resp.status_code >= 400:
-                    raise RuntimeError(f"Failed to mark verified: {upd_resp.status_code} {upd_resp.text}")
+        exp_dt = dt.datetime.fromisoformat(str(exp).replace("Z", "+00:00")) if exp else None
     except Exception:
-        # If marking verified fails, still keep code consumed; surface error
+        exp_dt = None
+
+    if (not code) or (payload.code != code):
+        # Increment attempts for throttling/observability
+        try:
+            current_attempts = int(row.get("code_attempts") or 0) + 1
+            _update_user_row(settings, payload.email, {"code_attempts": current_attempts})
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail="Invalid or expired code")
+
+    if (not exp_dt) or (exp_dt < _now_utc()):
+        raise HTTPException(status_code=400, detail="Invalid or expired code")
+
+    # Consume code and mark email verified
+    try:
+        _update_user_row(
+            settings,
+            payload.email,
+            {
+                "is_email_verified": True,
+                "current_verification_code": None,
+                "code_expires_at": None,
+                "code_attempts": 0,
+            },
+        )
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid or expired code")
 
 
@@ -344,11 +378,6 @@ def signin(
 ) -> AuthTokenResponse:
     """
     Authenticate using Supabase auth token endpoint and return the access token.
-
-    Notes:
-    - We call Supabase token endpoint (grant_type=password) using the project's anon key path.
-      Since we only have service role key in this backend, we proxy via the admin 'token' path.
-      In production, frontends usually call the public auth client directly.
     """
     _rate_limit_check(request, key_suffix="signin")
 
@@ -383,30 +412,43 @@ def forgot_password(
     settings: Settings = Depends(provide_settings),
 ) -> None:
     """
-    Request a password recovery link via Supabase and email it to the user.
+    For this unified schema, we send a code for reset and store it in public.users.
+    Frontend can present a reset form that calls /reset-password with code and new password.
     """
     _rate_limit_check(request, key_suffix="forgot-password")
 
+    # Ensure user exists in unified table to avoid enumeration details
     try:
-        link_info = supabase.generate_link(payload.email, "recovery", redirect_to=settings.SITE_URL)
+        row = _get_user_row_by_email(settings, payload.email)
+        if row is None:
+            # do not reveal; still send 204
+            return None
     except Exception:
-        raise HTTPException(status_code=400, detail="Unable to initiate password recovery")
+        # avoid leaking details
+        return None
 
-    action_link = None
-    if isinstance(link_info, dict):
-        action_link = link_info.get("properties", {}).get("action_link") or link_info.get("action_link")
+    reset_code = _gen_numeric_code(6)
+    expires_at = _now_utc() + dt.timedelta(seconds=settings.PASSWORD_RESET_TOKEN_TTL_SECONDS)
+    try:
+        _update_user_row(
+            settings,
+            payload.email,
+            {
+                "password_reset_code": reset_code,
+                "password_reset_expires": _iso_utc(expires_at),
+            },
+        )
+    except Exception:
+        # do not reveal specifics
+        return None
 
-    subject = "Password reset"
-    body = "Use the following link to reset your password."
-    if action_link:
-        body = f"{body}\n\n{action_link}"
-    else:
-        body = f"{body}\n\nPlease try again later."
-
+    subject = "Password reset code"
+    body = f"{reset_code}\n\nUse this code to reset your password. It expires in {int(settings.PASSWORD_RESET_TOKEN_TTL_SECONDS/60)} minutes."
     try:
         email_service.send_email(payload.email, subject, body)
     except Exception:
-        raise HTTPException(status_code=500, detail="Failed to send recovery email")
+        # swallow email errors to prevent enumeration
+        return None
 
 
 # PUBLIC_INTERFACE
@@ -425,24 +467,45 @@ def reset_password(
     payload: ResetPasswordRequest,
     request: Request,
     supabase: SupabaseAdminClient = Depends(provide_supabase_client),
+    settings: Settings = Depends(provide_settings),
 ) -> None:
     """
-    This endpoint is a placeholder for code-based reset. With Supabase, the recommended flow is:
-    - Call forgot-password to receive a recovery link via email.
-    - The user follows the link (handled by frontend), which provides a session to update password.
-
-    If you need server-side password update using admin privileges, you can implement:
-    - Lookup user by email.
-    - Update user password using Admin API.
-
-    Here, we implement a safe admin update by email to support a backend-driven flow
-    when a valid 'code' is presented (code validation is outside the scope).
+    Validate the provided code against public.users.password_reset_code/_expires,
+    then update the user's password via Supabase Admin, and clear reset fields.
     """
     _rate_limit_check(request, key_suffix="reset-password")
 
-    # We do not validate the code here, as the project currently relies on Supabase recovery links.
-    # To support admin-based reset for the provided email:
+    # Validate code
+    try:
+        row = _get_user_row_by_email(settings, payload.email)
+        if not row:
+            raise HTTPException(status_code=400, detail="Invalid code or request")
+        db_code = (row.get("password_reset_code") or "").strip()
+        exp = row.get("password_reset_expires")
+        try:
+            exp_dt = dt.datetime.fromisoformat(str(exp).replace("Z", "+00:00")) if exp else None
+        except Exception:
+            exp_dt = None
+        if (not db_code) or (payload.code != db_code) or (not exp_dt) or (exp_dt < _now_utc()):
+            raise HTTPException(status_code=400, detail="Invalid code or request")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid code or request")
+
+    # Update password in Supabase Auth
     try:
         supabase.admin_update_password_by_email(payload.email, payload.new_password)
     except Exception:
-        raise HTTPException(status_code=400, detail="Failed to reset password")
+        raise HTTPException(status_code=400, detail="Invalid code or request")
+
+    # Clear reset fields
+    try:
+        _update_user_row(
+            settings,
+            payload.email,
+            {"password_reset_code": None, "password_reset_expires": None},
+        )
+    except Exception:
+        # Even if clearing fails, do not leak; operation is effectively done
+        pass
