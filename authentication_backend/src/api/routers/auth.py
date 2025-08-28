@@ -139,8 +139,9 @@ def signup(
         code = created.get("code")
         if not code:
             raise RuntimeError("Code generation failed")
-    except Exception:
-        raise HTTPException(status_code=500, detail="Failed to prepare verification code")
+    except Exception as exc:
+        # Surface a concise reason to aid troubleshooting while not leaking secrets
+        raise HTTPException(status_code=500, detail=_safe_detail(exc, "Failed to prepare verification code"))
 
     # 4) Send plain email with only the code and short instructions
     subject = "Your verification code"
@@ -216,8 +217,8 @@ def send_verification_code(
         code = created.get("code")
         if not code:
             raise RuntimeError("Code generation failed")
-    except Exception:
-        raise HTTPException(status_code=500, detail="Failed to prepare verification code")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=_safe_detail(exc, "Failed to prepare verification code"))
 
     subject = "Your verification code"
     body = f"{code}\n\nEnter this 6-digit code in the app to verify your email. The code expires in {int(settings.VERIFICATION_CODE_TTL_SECONDS/60)} minutes."

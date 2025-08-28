@@ -43,12 +43,25 @@ class PostgrestClient:
         }
 
     def insert(self, table: str, row: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Insert a row and return the representation.
+
+        Raises:
+            RuntimeError: with detailed status code and response body on failure.
+        """
         endpoint = f"{self._base}/rest/v1/{table}"
         with httpx.Client(timeout=20) as client:
             resp = client.post(endpoint, headers=self._headers, json=row)
+            # PostgREST returns 201/200 with body when Prefer: return=representation
             if resp.status_code >= 400:
-                raise RuntimeError(f"PostgREST insert failed: {resp.status_code} {resp.text}")
-            data = resp.json()
+                body = resp.text
+                raise RuntimeError(f"PostgREST insert failed ({table}): {resp.status_code} {body}")
+            # Some setups may return 201 with an array
+            try:
+                data = resp.json()
+            except Exception:
+                # If no JSON body, return the sent row (best-effort)
+                return row
             if isinstance(data, list):
                 return data[0] if data else {}
             return data
@@ -58,8 +71,12 @@ class PostgrestClient:
         with httpx.Client(timeout=20) as client:
             resp = client.patch(endpoint, headers=self._headers, json=values)
             if resp.status_code >= 400:
-                raise RuntimeError(f"PostgREST update failed: {resp.status_code} {resp.text}")
-            data = resp.json()
+                raise RuntimeError(f"PostgREST update failed ({table}): {resp.status_code} {resp.text}")
+            try:
+                data = resp.json()
+            except Exception:
+                # No body returned
+                return {}
             if isinstance(data, list):
                 return data[0] if data else {}
             return data
@@ -71,9 +88,10 @@ class PostgrestClient:
         with httpx.Client(timeout=20) as client:
             resp = client.get(endpoint, headers={**self._headers, "Accept": "application/json"})
             if resp.status_code == 406:
+                # Not acceptable (e.g., no rows and no representation allowed) - treat as not found
                 return None
             if resp.status_code >= 400:
-                raise RuntimeError(f"PostgREST select failed: {resp.status_code} {resp.text}")
+                raise RuntimeError(f"PostgREST select failed ({table}): {resp.status_code} {resp.text}")
             data = resp.json()
             if isinstance(data, list):
                 return data[0] if data else None
@@ -85,9 +103,14 @@ def _now_ts() -> int:
 
 
 def _gen_code(length: int = 6) -> str:
-    # URL-safe alphanumeric; adjust to digits only if desired
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # avoid ambiguous chars
-    return "".join(secrets.choice(alphabet) for _ in range(length))
+    """
+    Generate a numeric verification code of given length (default 6 digits).
+    """
+    digits = "0123456789"
+    # Ensure first digit is non-zero to avoid leading zeros confusion in some clients
+    first = secrets.choice("123456789")
+    rest = "".join(secrets.choice(digits) for _ in range(max(0, length - 1)))
+    return first + rest
 
 
 @dataclass
@@ -116,16 +139,32 @@ class VerificationCodeDAO:
         import datetime as _dt
         expires_iso = _dt.datetime.utcfromtimestamp(expires_at).isoformat() + "Z"
 
-        code = _gen_code(length)
-        row = {
-            "user_id": user_id,
-            "email": email,
-            "purpose": purpose,
-            "code": code,
-            "expires_at": expires_iso,
-        }
-        created = self._pg.insert("verification_codes", row)
-        return created
+        # Try to insert, retrying on unique constraint/duplicate conflicts
+        attempts = 0
+        last_err: Optional[Exception] = None
+        while attempts < 5:
+            code = _gen_code(length)
+            row = {
+                "user_id": user_id,
+                "email": email,
+                "purpose": purpose,
+                "code": code,
+                "expires_at": expires_iso,
+            }
+            try:
+                created = self._pg.insert("verification_codes", row)
+                return created
+            except Exception as exc:
+                msg = str(exc).lower()
+                # Detect duplicate key/unique violation or conflict
+                if "duplicate key" in msg or "unique constraint" in msg or "uq_active_code" in msg or "409" in msg or "conflict" in msg:
+                    attempts += 1
+                    last_err = exc
+                    continue
+                # For other errors, do not retry
+                raise
+        # If we exhausted retries, raise a descriptive error
+        raise RuntimeError(f"Failed to create verification code after retries: {last_err}")
 
     # PUBLIC_INTERFACE
     def consume_code(self, email: str, purpose: Purpose, code: str) -> Optional[Dict[str, Any]]:
