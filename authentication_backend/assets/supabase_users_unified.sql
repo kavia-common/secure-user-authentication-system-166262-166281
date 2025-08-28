@@ -61,6 +61,7 @@ create table if not exists public.users (
 
 -- 2b) Create pending_signups table for pre-verification state
 -- Stores temporary signup info until code is verified; deleted on success.
+-- Note: Application enforces a 5-minute expiry for verification codes and pending signups.
 create table if not exists public.pending_signups (
   id uuid primary key default gen_random_uuid(),
   email text not null unique,

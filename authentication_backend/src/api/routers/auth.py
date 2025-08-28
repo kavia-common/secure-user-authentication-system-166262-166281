@@ -192,6 +192,13 @@ def signup(
         # Do not fail hard; proceed to pending path
         existing_user = None
 
+    # Opportunistic cleanup of any expired pending signups
+    try:
+        from ..services.pending_signup_dao import purge_expired  # type: ignore
+        purge_expired(settings)
+    except Exception:
+        pass
+
     # 2) Prepare 6-digit code and save into pending_signups
     code = _gen_numeric_code(6)
     expires_at = _now_utc() + dt.timedelta(seconds=settings.VERIFICATION_CODE_TTL_SECONDS)
@@ -207,7 +214,7 @@ def signup(
 
     # 3) Send email
     subject = "Your verification code"
-    body = f"{code}\n\nEnter this 6-digit code in the app to verify your email. The code expires in {int(settings.VERIFICATION_CODE_TTL_SECONDS/60)} minutes."
+    body = f"{code}\n\nEnter this 6-digit code in the app to verify your email. This code expires in 5 minutes."
     try:
         email_service.send_email(payload.email, subject, body)
     except Exception:
@@ -242,6 +249,13 @@ def send_verification_code(
     _rate_limit_check(request, key_suffix="send-code")
 
     from ..services.pending_signup_dao import get_pending_by_email, upsert_pending
+
+    # Opportunistic cleanup of expired pending signups
+    try:
+        from ..services.pending_signup_dao import purge_expired  # type: ignore
+        purge_expired(settings)
+    except Exception:
+        pass
 
     # If there is no pending record, create one with a dummy password to allow code resend flow.
     # We do not reveal whether a verified user exists; always return 204.
@@ -292,6 +306,12 @@ def verify_code(
     _rate_limit_check(request, key_suffix="verify")
 
     from ..services.pending_signup_dao import get_pending_by_email, increment_attempts, delete_pending
+    # Opportunistic cleanup of expired pending signups
+    try:
+        from ..services.pending_signup_dao import purge_expired  # type: ignore
+        purge_expired(settings)
+    except Exception:
+        pass
 
     # Load pending row
     try:
@@ -444,7 +464,7 @@ def forgot_password(
         return None
 
     subject = "Password reset code"
-    body = f"{reset_code}\n\nUse this code to reset your password. It expires in {int(settings.PASSWORD_RESET_TOKEN_TTL_SECONDS/60)} minutes."
+    body = f"{reset_code}\n\nUse this code to reset your password. This code expires in 5 minutes."
     try:
         email_service.send_email(payload.email, subject, body)
     except Exception:

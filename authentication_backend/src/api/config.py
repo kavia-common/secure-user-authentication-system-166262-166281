@@ -49,8 +49,9 @@ class Settings(BaseModel):
     SITE_URL: str = Field(..., description="Public site URL used in emails (e.g., https://app.example.com)")
 
     # Security
-    VERIFICATION_CODE_TTL_SECONDS: int = Field(10 * 60, description="Verification code time-to-live (seconds).")
-    PASSWORD_RESET_TOKEN_TTL_SECONDS: int = Field(15 * 60, description="Password reset token TTL (seconds).")
+    # Set default TTLs (can be overridden via .env). Requirement: 5 minutes for both.
+    VERIFICATION_CODE_TTL_SECONDS: int = Field(5 * 60, description="Verification code time-to-live (seconds).")
+    PASSWORD_RESET_TOKEN_TTL_SECONDS: int = Field(5 * 60, description="Password reset token TTL (seconds).")
 
     class Config:
         extra = "ignore"
@@ -88,8 +89,8 @@ def get_settings() -> Settings:
 
             SITE_URL=get_raw_env("SITE_URL", "") or "",
 
-            VERIFICATION_CODE_TTL_SECONDS=int(get_raw_env("VERIFICATION_CODE_TTL_SECONDS", str(10 * 60))),
-            PASSWORD_RESET_TOKEN_TTL_SECONDS=int(get_raw_env("PASSWORD_RESET_TOKEN_TTL_SECONDS", str(15 * 60))),
+            VERIFICATION_CODE_TTL_SECONDS=int(get_raw_env("VERIFICATION_CODE_TTL_SECONDS", str(5 * 60))),
+            PASSWORD_RESET_TOKEN_TTL_SECONDS=int(get_raw_env("PASSWORD_RESET_TOKEN_TTL_SECONDS", str(5 * 60))),
         )
     except ValidationError as e:
         # Provide a clearer error for missing required envs

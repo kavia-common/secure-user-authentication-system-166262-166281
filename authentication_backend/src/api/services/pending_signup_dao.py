@@ -127,3 +127,46 @@ def delete_pending(settings: Settings, email: str) -> None:
         if resp.status_code >= 400:
             # Non-fatal cleanup error
             return
+
+
+# PUBLIC_INTERFACE
+def purge_expired(settings: Settings) -> int:
+    """
+    Delete all pending_signups whose code_expires_at is in the past.
+
+    Returns:
+        int: Count of rows deleted (best-effort; 0 if unknown).
+    """
+    deleted = 0
+    try:
+        with httpx.Client(timeout=20) as client:
+            # Fetch ids and code_expires_at, filter locally based on current UTC time
+            list_resp = client.get(f"{_endpoint(settings)}?select=id,code_expires_at", headers=_headers(settings))
+            if list_resp.status_code >= 400:
+                return 0
+            data = list_resp.json()
+            rows = data if isinstance(data, list) else []
+            import datetime as _dt
+            now = _dt.datetime.now(_dt.timezone.utc)
+            expired_ids = []
+            for r in rows:
+                exp_raw = r.get("code_expires_at")
+                try:
+                    exp_dt = _dt.datetime.fromisoformat(str(exp_raw).replace("Z", "+00:00"))
+                except Exception:
+                    exp_dt = None
+                if exp_dt and exp_dt < now:
+                    rid = r.get("id")
+                    if rid:
+                        expired_ids.append(rid)
+            if not expired_ids:
+                return 0
+            in_list = ",".join(expired_ids)
+            del_ep = f"{_endpoint(settings)}?id=in.({in_list})"
+            del_resp = client.delete(del_ep, headers=_headers(settings))
+            if del_resp.status_code >= 400:
+                return 0
+            deleted = len(expired_ids)
+    except Exception:
+        return 0
+    return deleted
