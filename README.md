@@ -13,4 +13,9 @@ This project uses Supabase for Authentication and Postgres storage. Before runni
   - SMTP_* and SITE_URL
 
 3) Run backend
-- Install Python dependencies and start FastAPI as per container instructions.
+- Create virtualenv (optional), install dependencies, and start FastAPI:
+  - cd authentication_backend
+  - pip install -r requirements.txt
+  - uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+
+Docs available at /docs and OpenAPI at /openapi.json (also exported to authentication_backend/interfaces/openapi.json via src/api/generate_openapi.py).

@@ -1,3 +1,15 @@
+"""
+FastAPI application entrypoint for the Authentication Backend.
+
+Exposes:
+- GET /           Health check
+- /auth/*         Authentication endpoints (signup, send-code, verify, signin, forgot/reset)
+
+Includes:
+- CORS configuration
+- Global error handlers
+- OpenAPI tags and metadata
+"""
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
@@ -13,7 +25,7 @@ from .error_handlers import (
     generic_exception_handler,
 )
 
-# Initialize settings and logging
+# Initialize settings and logging early
 settings = get_settings()
 configure_logging()
 logger = get_logger(__name__)
@@ -37,15 +49,14 @@ app = FastAPI(
 )
 
 # CORS configuration:
-# - In development (APP_ENV != production): allow all origins for ease of local dev.
-# - In production: restrict to FRONTEND_BASE_URL if present, else fall back to CORS_ALLOW_ORIGINS.
+# - In development (APP_ENV != production): allow all origins for local dev.
+# - In production: restrict to FRONTEND_BASE_URL if present, else use CORS_ALLOW_ORIGINS list.
 app_env = (settings.APP_ENV or "development").lower()
 frontend_base = get_raw_env("FRONTEND_BASE_URL", "").strip()
 if app_env == "production":
     if frontend_base:
         allow_origins = [frontend_base]
     else:
-        # fallback to configured list or block by default to avoid open CORS in prod
         configured = [o.strip() for o in (settings.CORS_ALLOW_ORIGINS or "").split(",") if o.strip()]
         allow_origins = configured if configured else []
 else:
@@ -53,7 +64,7 @@ else:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_origins if allow_origins else [],  # empty list means no cross-origin allowed
+    allow_origins=allow_origins if allow_origins else [],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -74,7 +85,12 @@ app.add_exception_handler(Exception, generic_exception_handler)
     description="Returns a simple health message for uptime monitoring.",
 )
 def health_check() -> HealthResponse:
-    """Service health check endpoint."""
+    """
+    Service health check endpoint.
+
+    Returns:
+        HealthResponse: A simple 'Healthy' message indicating service readiness.
+    """
     logger.debug("Health check invoked")
     return HealthResponse(message="Healthy")
 
